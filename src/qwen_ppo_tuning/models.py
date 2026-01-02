@@ -72,6 +72,17 @@ class SetupQwenModel(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=betas, **extra_args)
         return optimizer
 
+    def enable_training(self, **kwargs):
+        self.training_enabled = True
+        self.model.train()
+        if self.optimizer is None:
+            self.optimizer = self.configure_optimizer(
+                lr=kwargs.get("lr", 1e-06),
+                weight_decay=kwargs.get("weight_decay", 0.0),
+                betas=(kwargs.get("beta1", 0.9), kwargs.get("beta2", 0.999)),
+                device_type="cuda" if torch.cuda.is_available() else "cpu",
+            )
+
 
 class QwenModel(SetupQwenModel):
     def __init__(self, model_path: str, model_type: str = "QWEN2", **kwargs):
@@ -131,6 +142,7 @@ class QwenModel(SetupQwenModel):
                     if current_len > self.block_size
                     else valid_tokens
                 )
+
                 logits = self.model(context_input)
                 next_token_logits = logits[:, -1, :] / temperature
                 if return_logits:
@@ -290,6 +302,55 @@ class QwenModel(SetupQwenModel):
         }
 
 
+class QwenModelValueHead(SetupQwenModel):
+    def __init__(self, model_path: str, model_type: str = "QWEN2", **kwargs):
+        super().__init__(model_path=model_path, model_type=model_type, **kwargs)
+        self.hidden_size = self._get_hidden_size()
+        self.value_head = nn.Linear(self.hidden_size, 1)
+        self.value_head.to(self.device)
+
+    def forward(self, input_ids: torch.LongTensor):
+        hidden_states = self.get_last_hidden_state(input_ids.to(self.device))
+        values = self.value_head(hidden_states)
+        return values
+
+    def _get_hidden_size(self):
+        if hasattr(self.model, "tok_embeddings"):
+            hidden_size = self.model.tok_embeddings.weight.size(1)
+        elif hasattr(self.model, "embed_tokens"):
+            hidden_size = self.model.embed_tokens.weight.size(1)
+        else:
+            raise ValueError("Cannot determine hidden size from the model architecture.")
+        return hidden_size
+
+    def get_last_hidden_state(self, input_ids: torch.LongTensor):
+        if input_ids.size(1) > self.model.max_seq_len:
+            raise ValueError(
+                f"Input sequence length {input_ids.size(1)} exceeds model's maximum sequence length {self.model.max_seq_len}."
+            )
+        hidden_state = self.model.tok_embeddings(input_ids)
+        for layer in self.model.layers:
+            hidden_state = layer(hidden_state)
+        hidden_state = self.model.norm(hidden_state)
+        return hidden_state
+
+
+class ReferenceQwenModel(QwenModel):
+    def __init__(self, model_path: str, model_type: str = "QWEN2", **kwargs):
+        super().__init__(model_path=model_path, model_type=model_type, **kwargs)
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self.model.eval()
+
+
+class PolicyQwenModel(QwenModel):
+    def __init__(self, model_path: str, model_type: str = "QWEN2", **kwargs):
+        super().__init__(model_path=model_path, model_type=model_type, **kwargs)
+        for param in self.model.parameters():
+            param.requires_grad = True
+        self.model.train()
+
+
 if __name__ == "__main__":
     model = QwenModel(model_path="/workspace/base_models/Qwen2.5-1.5B")
     print("Model and optimizer initialized successfully.")
@@ -314,3 +375,8 @@ if __name__ == "__main__":
 
     response_properties = model.get_batched_response_properties(generation_outputs, pad_to=256)
     print("Batched response properties computed successfully.")
+
+    value_model = QwenModelValueHead(model_path="/workspace/base_models/Qwen2.5-1.5B")
+    dummy_input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    values = value_model(dummy_input_ids)
+    print("Value head output shape:", values.shape)  # Expected shape: (1, 5, 1)
