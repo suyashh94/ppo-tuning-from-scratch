@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Logs
+*.log
+logs/
+
+# Data (usually large)
+data/
+*.csv
+*.parquet
+*.arrow
+*.h5
+*.hdf5
+
+# Model checkpoints (usually large)
+checkpoints/
+models/
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Experiment tracking
+mlruns/
+wandb/
+*.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Misc
+.DS_Store
+Thumbs.db
+*.bak
+
+# Model folders
+base_models/

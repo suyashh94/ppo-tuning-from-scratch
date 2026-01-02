@@ -1,0 +1,34 @@
+# Git
+.git/
+.gitignore
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+
+# Data and models (usually large)
+data/
+checkpoints/
+models/
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Experiment tracking
+mlruns/
+wandb/
+*.db
+
+# Misc
+.DS_Store
+*.bak
+*.log
