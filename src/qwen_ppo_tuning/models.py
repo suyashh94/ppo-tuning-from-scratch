@@ -8,6 +8,8 @@ from torchtune.models.qwen2_5 import qwen2_5_1_5b_base
 from torchtune.training import FullModelHFCheckpointer
 from transformers import AutoTokenizer
 
+from qwen_ppo_tuning.utils import logprobs_from_logits, pad_sequences
+
 
 class SetupQwenModel(nn.Module):
     def __init__(self, model_path: str, model_type: str = "QWEN2", **kwargs):
@@ -16,6 +18,7 @@ class SetupQwenModel(nn.Module):
         self.base_model_path = model_path
         self.block_size = 128000
         self.model_type = model_type
+        self.training_enabled = kwargs.get("training_enabled", False)
         self.setup_model(**kwargs if kwargs else {})
 
     def setup_model(self, **kwargs):
@@ -37,12 +40,17 @@ class SetupQwenModel(nn.Module):
         )
         state = checkpointer.load_checkpoint()["model"]
         self.model.load_state_dict(state)
+        del state
         self.model.to(self.device).eval()
-        self.optimizer = self.configure_optimizer(
-            lr,
-            weight_decay,
-            (beta1, beta2),
-            device_type="cuda" if torch.cuda.is_available() else "cpu",
+        self.optimizer = (
+            self.configure_optimizer(
+                lr,
+                weight_decay,
+                (beta1, beta2),
+                device_type="cuda" if torch.cuda.is_available() else "cpu",
+            )
+            if self.training_enabled
+            else None
         )
 
     def configure_optimizer(self, lr, weight_decay, betas, device_type="cuda"):
@@ -106,57 +114,73 @@ class QwenModel(SetupQwenModel):
         max_tokens_generated = False
         n_tokens_generated = 0
         generation_logits = []
-        generated_ids = input_ids.clone()
+        input_len = input_ids.size(1)
+        total_len = input_len + max_new_tokens
 
-        while not end_token_found and not max_tokens_generated:
-            context_input = (
-                generated_ids[:, -self.block_size :]
-                if generated_ids.size(1) > self.block_size
-                else generated_ids
-            )
-            logits = self.model(context_input)
-            next_token_logits = logits[:, -1, :] / temperature
-            if return_logits:
-                generation_logits.append(next_token_logits.clone().detach().cpu())
+        # Pre-allocate buffer for generated tokens
+        generated_tokens = torch.zeros((1, total_len), dtype=torch.long, device=self.device)
+        generated_tokens[0, :input_len] = input_ids[0]
+        current_len = input_len
 
-            if repetition_penalty != 1.0:
-                for token_id in set(generated_ids.view(-1).tolist()):
-                    if next_token_logits[0, token_id] < 0:
-                        next_token_logits[0, token_id] *= repetition_penalty
-                    else:
-                        next_token_logits[0, token_id] /= repetition_penalty
-
-            if top_k is not None:
-                top_k = min(top_k, next_token_logits.size(-1))
-                indices_to_remove = (
-                    next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+        with torch.no_grad():
+            while not end_token_found and not max_tokens_generated:
+                # Use only the valid portion of the buffer
+                valid_tokens = generated_tokens[:, :current_len]
+                context_input = (
+                    valid_tokens[:, -self.block_size :]
+                    if current_len > self.block_size
+                    else valid_tokens
                 )
-                next_token_logits[indices_to_remove] = -float("Inf")
+                logits = self.model(context_input)
+                next_token_logits = logits[:, -1, :] / temperature
+                if return_logits:
+                    generation_logits.append(next_token_logits.clone().detach().cpu())
 
-            if sample_max:
-                next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
-            else:
-                probabilities = torch.nn.functional.softmax(next_token_logits, dim=-1)
-                next_token = torch.multinomial(probabilities, num_samples=1)
+                if repetition_penalty != 1.0:
+                    for token_id in set(valid_tokens.view(-1).tolist()):
+                        if next_token_logits[0, token_id] < 0:
+                            next_token_logits[0, token_id] *= repetition_penalty
+                        else:
+                            next_token_logits[0, token_id] /= repetition_penalty
 
-            if next_token.item() == self.tokenizer.eos_token_id:
-                end_token_found = True
+                if top_k is not None:
+                    top_k_val = min(top_k, next_token_logits.size(-1))
+                    indices_to_remove = (
+                        next_token_logits
+                        < torch.topk(next_token_logits, top_k_val)[0][..., -1, None]
+                    )
+                    next_token_logits[indices_to_remove] = -float("Inf")
 
-            generated_ids = torch.cat((generated_ids, next_token), dim=1)
-            n_tokens_generated += 1
-            if n_tokens_generated > max_new_tokens:
-                max_tokens_generated = True
+                if sample_max:
+                    next_token = torch.argmax(next_token_logits, dim=-1)
+                else:
+                    probabilities = torch.nn.functional.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
+
+                if next_token.item() == self.tokenizer.eos_token_id:
+                    end_token_found = True
+
+                # Write to pre-allocated buffer instead of concatenating
+                generated_tokens[0, current_len] = next_token
+                current_len += 1
+                n_tokens_generated += 1
+
+                if n_tokens_generated >= max_new_tokens:
+                    max_tokens_generated = True
+
+        # Return only the valid portion of the buffer
+        final_tokens = generated_tokens[:, :current_len]
 
         if return_logits:
             return {
-                "generated_ids": generated_ids,
+                "generated_ids": final_tokens,
                 "logits": torch.stack(generation_logits, dim=1),
                 "max_tokens_generated": max_tokens_generated,
                 "end_token_found": end_token_found,
             }
 
         return {
-            "generated_ids": generated_ids,
+            "generated_ids": final_tokens,
             "max_tokens_generated": max_tokens_generated,
             "end_token_found": end_token_found,
         }
@@ -202,20 +226,91 @@ class QwenModel(SetupQwenModel):
         res["response_length"] = len(response_ids)
         return res
 
+    def get_batched_response_properties(self, generated_outputs_list: list[dict], **kwargs):
+        """Get response properties from a batch of generated outputs.
+
+        Args:
+            generated_outputs_list (list[dict]): List of generated output dictionaries.
+        Returns:
+            dict: Dictionary containing lists of response properties.
+            Response properties include:
+                - log_probs : Log probabilities of the generated tokens.
+                - logits: Logits of the generated tokens.
+                - prompt_mask: Mask indicating prompt tokens.
+                - response_mask: Mask indicating response tokens.
+                - padding_mask: Mask indicating padding tokens.
+
+        Example:
+            - For one sample, we have the entire sequence, consisting of prompt tokens and response tokens.
+            - generated ids have shape (1, prompt_length + response_length)
+            - input_length is the length of the prompt tokens
+            - We pad the generated ids to the same length across the batch.
+            - On the basis of "tokens" that will play a role in PPO, we create masks for prompt, response, and padding.
+
+            example:
+                - generated_ids: [101, 2003, 2023, 102, 2054, 2003, 1996, 2562, 102]
+                - input_length: 4 (length of prompt tokens)
+                - response_length: 5 (length of response tokens)
+                - padded to length of 12 ; padding token is 0
+                - padded_generated_ids: [101, 2003, 2023, 102, 2054, 2003, 1996, 2562, 102, 0, 0, 0]
+                - Our response properties will be of shape 1 X 11 and not 1 X 12 as first token is not considered for PPO (no action taken before first token)
+                - prompt_mask will be [1,1,1,0,0,0,0,0,0,0,0,] and not [1,1,1,1,0,0,0,0,0,0,0,] because response starts when last prompt token is input; Hence, that action is accounted for in PPO.
+                - reponse_mask will be 1 - prompt_mask
+                - padding_mask will be [0,0,0,0,0,0,0,0,1,1,1]
+        """
+        pad_token_id = self.tokenizer.pad_token_id
+        input_lengths = [g["input_length"] for g in generated_outputs_list]
+        generated_ids = [g["generated_ids"][0].tolist() for g in generated_outputs_list]
+
+        padded_generated_ids = pad_sequences(
+            generated_ids, pad_value=pad_token_id, padding="right", **kwargs
+        )
+        padded_generated_ids_tensor = torch.LongTensor(padded_generated_ids).to(self.device)
+        with torch.no_grad():
+            logits = self.model(padded_generated_ids_tensor)
+            logits = logits[:, :-1, :]  # align logits with labels
+
+        log_probs = logprobs_from_logits(
+            logits, labels=padded_generated_ids_tensor[:, 1:]
+        ).cpu()  # ignored firist token as that is not sampled in generation
+        batch_size, seq_len = padded_generated_ids_tensor.size()
+        prompt_mask = torch.zeros((batch_size, seq_len - 1), dtype=torch.bool)
+        for i in range(batch_size):
+            prompt_length = input_lengths[i]
+            if prompt_length > 0:
+                prompt_mask[i, : prompt_length - 1] = 1
+        response_mask = ~prompt_mask
+        padding_mask = padded_generated_ids_tensor.eq(pad_token_id).cpu()
+        return {
+            "log_probs": log_probs,
+            "logits": logits.cpu(),
+            "prompt_mask": prompt_mask,
+            "response_mask": response_mask,
+            "padding_mask": padding_mask,
+        }
+
 
 if __name__ == "__main__":
     model = QwenModel(model_path="/workspace/base_models/Qwen2.5-1.5B")
     print("Model and optimizer initialized successfully.")
 
-    prompt = "Explain the theory of relativity in simple terms."
-    generation_output = model.generate(
-        prompt,
-        max_new_tokens=500,
-        temperature=0.7,
-        top_k=50,
-        sample_max=False,
-        repetition_penalty=1.2,
-        return_logits=False,
-    )
-    print("Prompt:", generation_output["input_text"])
-    print("Response:", generation_output["response_text"])
+    prompts = ["Explain the theory of relativity in simple terms.", "How do airplanes fly?"]
+    generation_outputs = [
+        model.generate(
+            prompt,
+            max_new_tokens=100,
+            temperature=0.7,
+            top_k=50,
+            sample_max=False,
+            repetition_penalty=1.2,
+            return_logits=False,
+        )
+        for prompt in prompts
+    ]
+
+    for generation_output in generation_outputs:
+        print("Prompt:", generation_output["input_text"])
+        print("Response:", generation_output["response_text"])
+
+    response_properties = model.get_batched_response_properties(generation_outputs, pad_to=256)
+    print("Batched response properties computed successfully.")
