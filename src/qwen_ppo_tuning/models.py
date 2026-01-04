@@ -185,16 +185,16 @@ class QwenModel(SetupQwenModel):
 
         if return_logits:
             return {
-                "generated_ids": final_tokens,
+                "response_ids": final_tokens,
                 "logits": torch.stack(generation_logits, dim=1),
                 "max_tokens_generated": max_tokens_generated,
                 "end_token_found": end_token_found,
             }
 
         return {
-            "generated_ids": final_tokens,
-            "max_tokens_generated": max_tokens_generated,
-            "end_token_found": end_token_found,
+            "response_ids": final_tokens,  # 1 x (input_len + n_generated)
+            "max_tokens_generated": max_tokens_generated,  # bool
+            "end_token_found": end_token_found,  # bool
         }
 
     def generate(
@@ -229,13 +229,13 @@ class QwenModel(SetupQwenModel):
             repetition_penalty=repetition_penalty,
             return_logits=return_logits,
         )
-        response_ids = res["generated_ids"][0][len(input_ids[0]) :]
-        response_text = self.tokenizer.decode(response_ids.tolist(), skip_special_tokens=True)
+        generated_ids = res["response_ids"][0][len(input_ids[0]) :]
+        response_text = self.tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
         input_text = self.tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=True)
-        res["input_text"] = input_text
-        res["response_text"] = response_text
-        res["input_length"] = len(input_ids[0])
-        res["response_length"] = len(response_ids)
+        res["input_text"] = input_text  # string
+        res["response_text"] = response_text  # string
+        res["input_length"] = len(input_ids[0])  # int
+        res["generated_response_length"] = len(generated_ids)  # int
         return res
 
     def get_batched_response_properties(self, generated_outputs_list: list[dict], **kwargs):
@@ -272,7 +272,8 @@ class QwenModel(SetupQwenModel):
         """
         pad_token_id = self.tokenizer.pad_token_id
         input_lengths = [g["input_length"] for g in generated_outputs_list]
-        generated_ids = [g["generated_ids"][0].tolist() for g in generated_outputs_list]
+        generated_ids = [g["response_ids"][0].tolist() for g in generated_outputs_list]
+        response_id_lengths = [len(g["response_ids"][0]) for g in generated_outputs_list]
 
         padded_generated_ids = pad_sequences(
             generated_ids, pad_value=pad_token_id, padding="right", **kwargs
@@ -284,21 +285,27 @@ class QwenModel(SetupQwenModel):
 
         log_probs = logprobs_from_logits(
             logits, labels=padded_generated_ids_tensor[:, 1:]
-        ).cpu()  # ignored firist token as that is not sampled in generation
+        ).cpu()  # ignored first token as that is not sampled in generation
         batch_size, seq_len = padded_generated_ids_tensor.size()
         prompt_mask = torch.zeros((batch_size, seq_len - 1), dtype=torch.bool)
+        response_mask = torch.zeros((batch_size, seq_len - 1), dtype=torch.bool)
         for i in range(batch_size):
             prompt_length = input_lengths[i]
             if prompt_length > 0:
                 prompt_mask[i, : prompt_length - 1] = 1
-        response_mask = ~prompt_mask
+            response_mask[i, prompt_length - 1 : response_id_lengths[i] - 1] = 1
+
         padding_mask = padded_generated_ids_tensor.eq(pad_token_id).cpu()
+        padding_mask = padding_mask[:, : seq_len - 1]
+
         return {
-            "log_probs": log_probs,
-            "logits": logits.cpu(),
-            "prompt_mask": prompt_mask,
-            "response_mask": response_mask,
-            "padding_mask": padding_mask,
+            "logprobs": log_probs,  # shape (batch_size, seq_len - 1)
+            "logits": logits.cpu(),  # shape (batch_size, seq_len - 1, vocab_size)
+            "prompt_mask": prompt_mask,  # shape (batch_size, seq_len - 1)
+            "response_mask": response_mask,  # shape (batch_size, seq_len - 1)
+            "padding_mask": padding_mask,  # shape (batch_size, seq_len - 1)
+            "padded_generated_ids": padded_generated_ids_tensor,  # shape (batch_size, seq_len)
+            "response_id_lengths": response_id_lengths,  # list of ints
         }
 
 
