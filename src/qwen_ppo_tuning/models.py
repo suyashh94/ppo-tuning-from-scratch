@@ -8,6 +8,7 @@ from torchtune.models.qwen2_5 import qwen2_5_1_5b_base
 from torchtune.training import FullModelHFCheckpointer
 from transformers import AutoTokenizer
 
+from qwen_ppo_tuning.config import GenerationConfig
 from qwen_ppo_tuning.utils import logprobs_from_logits, pad_sequences
 
 
@@ -55,8 +56,8 @@ class SetupQwenModel(nn.Module):
 
     def configure_optimizer(self, lr, weight_decay, betas, device_type="cuda"):
         params_dict = {pn: p for pn, p in self.model.named_parameters() if p.requires_grad}
-        decay_params = [p for n, p in params_dict.items() if p.dim() > 1]
-        no_decay_params = [p for n, p in params_dict.items() if p.dim() <= 1]
+        decay_params = [p for _, p in params_dict.items() if p.dim() > 1]
+        no_decay_params = [p for _, p in params_dict.items() if p.dim() <= 1]
         optim_groups = [
             {"params": decay_params, "weight_decay": weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
@@ -92,6 +93,77 @@ class QwenModel(SetupQwenModel):
         logits = self.model(input_ids)
         return logits
 
+    def _delete_kv_caches(self):
+        """Delete KV caches from all attention layers to allow normal forward passes."""
+        for layer in self.model.layers:
+            if hasattr(layer, "attn"):
+                if hasattr(layer.attn, "kv_cache"):
+                    layer.attn.kv_cache = None
+                if hasattr(layer.attn, "cache_enabled"):
+                    layer.attn.cache_enabled = False
+        # Reset the cache seq len trackers
+        self.model.decoder_max_cache_seq_len = None
+        self.model.encoder_max_cache_seq_len = None
+
+    def _sample_next_token(
+        self,
+        logits: torch.Tensor,
+        generated_tokens: torch.Tensor,
+        temperature: float,
+        top_k: int | None,
+        repetition_penalty: float,
+        sample_max: bool,
+    ) -> torch.Tensor:
+        """Sample the next token from logits with various sampling strategies.
+
+        Args:
+            logits: Raw logits for the next token (1, vocab_size).
+            generated_tokens: All tokens generated so far for repetition penalty.
+            temperature: Sampling temperature.
+            top_k: Top-k sampling parameter.
+            repetition_penalty: Repetition penalty factor.
+            sample_max: Whether to use argmax instead of sampling.
+
+        Returns:
+            The sampled next token (1,).
+        """
+        next_token_logits = logits / temperature
+
+        # Apply repetition penalty
+        if repetition_penalty != 1.0:
+            for token_id in set(generated_tokens.view(-1).tolist()):
+                if next_token_logits[0, token_id] < 0:
+                    next_token_logits[0, token_id] *= repetition_penalty
+                else:
+                    next_token_logits[0, token_id] /= repetition_penalty
+
+        # Apply top-k filtering
+        if top_k is not None:
+            top_k_val = min(top_k, next_token_logits.size(-1))
+            indices_to_remove = (
+                next_token_logits < torch.topk(next_token_logits, top_k_val)[0][..., -1, None]
+            )
+            next_token_logits[indices_to_remove] = -float("Inf")
+
+        # Handle numerical stability issues
+        next_token_logits = torch.nan_to_num(
+            next_token_logits,
+            nan=0.0,
+            posinf=1e20,
+            neginf=-1e20,
+        )
+
+        # Sample or argmax
+        if sample_max:
+            next_token = torch.argmax(next_token_logits, dim=-1)
+        else:
+            probabilities = torch.nn.functional.softmax(next_token_logits, dim=-1)
+            probabilities = torch.clamp(probabilities, min=1e-20)
+            probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
+            next_token = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
+
+        return next_token
+
     def _generate_from_tensor(
         self,
         input_ids: torch.LongTensor,
@@ -101,8 +173,9 @@ class QwenModel(SetupQwenModel):
         sample_max: bool = False,
         repetition_penalty: float = 1.0,
         return_logits: bool = False,
+        use_kv_cache: bool = True,
     ):
-        """Generate tokens from input tensor belonging to 1 tokenized prompt.
+        """Generate tokens from input tensor.
 
         Args:
             input_ids (torch.LongTensor): Input tensor of shape (1, sequence_length).
@@ -112,29 +185,49 @@ class QwenModel(SetupQwenModel):
             sample_max (bool): Whether to sample the maximum probability token.
             repetition_penalty (float): Repetition penalty factor.
             return_logits (bool): Whether to return logits along with generated tokens.
+            use_kv_cache (bool): Whether to use KV caching for faster generation.
 
         """
+        if use_kv_cache:
+            return self._generate_with_kv_cache(
+                input_ids, max_new_tokens, temperature, top_k,
+                sample_max, repetition_penalty, return_logits
+            )
+        else:
+            return self._generate_without_cache(
+                input_ids, max_new_tokens, temperature, top_k,
+                sample_max, repetition_penalty, return_logits
+            )
 
-        # Ensure input is on the correct device
+    def _generate_without_cache(
+        self,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int,
+        temperature: float,
+        top_k: int | None,
+        sample_max: bool,
+        repetition_penalty: float,
+        return_logits: bool,
+    ):
+        """Generate tokens without KV caching (original implementation)."""
         input_ids = input_ids.to(self.device)
-        # Ensure shape is (1, sequence_length)
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
 
-        end_token_found = False
-        max_tokens_generated = False
-        n_tokens_generated = 0
-        generation_logits = []
         input_len = input_ids.size(1)
-        total_len = input_len + max_new_tokens
+        total_len = min(input_len + max_new_tokens, self.block_size)
+        max_new_tokens = total_len - input_len
 
-        # Pre-allocate buffer for generated tokens
         generated_tokens = torch.zeros((1, total_len), dtype=torch.long, device=self.device)
         generated_tokens[0, :input_len] = input_ids[0]
+
+        generation_logits = []
+        end_token_found = False
+        n_tokens_generated = 0
         current_len = input_len
 
         with torch.no_grad():
-            while not end_token_found and not max_tokens_generated:
+            while not end_token_found and n_tokens_generated < max_new_tokens:
                 # Use only the valid portion of the buffer
                 valid_tokens = generated_tokens[:, :current_len]
                 context_input = (
@@ -144,57 +237,31 @@ class QwenModel(SetupQwenModel):
                 )
 
                 logits = self.model(context_input)
-                next_token_logits = logits[:, -1, :] / temperature
+                next_logits = logits[:, -1, :]
+
                 if return_logits:
-                    generation_logits.append(next_token_logits.clone().detach().cpu())
-
-                if repetition_penalty != 1.0:
-                    for token_id in set(valid_tokens.view(-1).tolist()):
-                        if next_token_logits[0, token_id] < 0:
-                            next_token_logits[0, token_id] *= repetition_penalty
-                        else:
-                            next_token_logits[0, token_id] /= repetition_penalty
-
-                if top_k is not None:
-                    top_k_val = min(top_k, next_token_logits.size(-1))
-                    indices_to_remove = (
-                        next_token_logits
-                        < torch.topk(next_token_logits, top_k_val)[0][..., -1, None]
+                    generation_logits.append(
+                        (next_logits / temperature).clone().detach().cpu()
                     )
-                    next_token_logits[indices_to_remove] = -float("Inf")
 
-                # Handle numerical stability issues
-                # Replace NaN/Inf with very small/large finite values
-                next_token_logits = torch.nan_to_num(
-                    next_token_logits,
-                    nan=0.0,
-                    posinf=1e20,
-                    neginf=-1e20,
+                next_token = self._sample_next_token(
+                    next_logits,
+                    valid_tokens,
+                    temperature,
+                    top_k,
+                    repetition_penalty,
+                    sample_max,
                 )
-
-                if sample_max:
-                    next_token = torch.argmax(next_token_logits, dim=-1)
-                else:
-                    probabilities = torch.nn.functional.softmax(next_token_logits, dim=-1)
-                    # Clamp probabilities to ensure they're valid for multinomial
-                    probabilities = torch.clamp(probabilities, min=1e-20)
-                    # Renormalize after clamping
-                    probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
-                    next_token = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
 
                 if next_token.item() == self.tokenizer.eos_token_id:
                     end_token_found = True
 
-                # Write to pre-allocated buffer instead of concatenating
                 generated_tokens[0, current_len] = next_token
                 current_len += 1
                 n_tokens_generated += 1
 
-                if n_tokens_generated >= max_new_tokens:
-                    max_tokens_generated = True
-
-        # Return only the valid portion of the buffer
         final_tokens = generated_tokens[:, :current_len]
+        max_tokens_generated = n_tokens_generated >= max_new_tokens
 
         if return_logits:
             return {
@@ -205,42 +272,156 @@ class QwenModel(SetupQwenModel):
             }
 
         return {
-            "response_ids": final_tokens,  # 1 x (input_len + n_generated)
-            "max_tokens_generated": max_tokens_generated,  # bool
-            "end_token_found": end_token_found,  # bool
+            "response_ids": final_tokens,
+            "max_tokens_generated": max_tokens_generated,
+            "end_token_found": end_token_found,
+        }
+
+    def _generate_with_kv_cache(
+        self,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int,
+        temperature: float,
+        top_k: int | None,
+        sample_max: bool,
+        repetition_penalty: float,
+        return_logits: bool,
+    ):
+        """Generate tokens using KV caching for efficiency."""
+        input_ids = input_ids.to(self.device)
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+
+        input_len = input_ids.size(1)
+        total_len = min(input_len + max_new_tokens, self.block_size)
+        max_new_tokens = total_len - input_len
+
+        generated_tokens = torch.zeros((1, total_len), dtype=torch.long, device=self.device)
+        generated_tokens[0, :input_len] = input_ids[0]
+
+        generation_logits = []
+        end_token_found = False
+        n_tokens_generated = 0
+        current_len = input_len
+
+        with torch.no_grad():
+            model_dtype = next(self.model.parameters()).dtype
+
+            self.model.setup_caches(
+                batch_size=1,
+                dtype=model_dtype,
+                decoder_max_seq_len=total_len,
+            )
+            self.model.to(self.device)
+
+            try:
+                causal_mask = torch.tril(
+                    torch.ones(total_len, total_len, dtype=torch.bool, device=self.device)
+                )
+
+                # === Prefill phase ===
+                prompt_positions = torch.arange(0, input_len, device=self.device).unsqueeze(0)
+                prefill_mask = causal_mask[:input_len, :].unsqueeze(0)
+
+                logits = self.model(input_ids, input_pos=prompt_positions, mask=prefill_mask)
+                next_logits = logits[:, -1, :]
+
+                if return_logits:
+                    generation_logits.append((next_logits / temperature).clone().detach().cpu())
+
+                next_token = self._sample_next_token(
+                    next_logits,
+                    generated_tokens[:, :current_len],
+                    temperature,
+                    top_k,
+                    repetition_penalty,
+                    sample_max,
+                )
+
+                if next_token.item() == self.tokenizer.eos_token_id:
+                    end_token_found = True
+
+                generated_tokens[0, current_len] = next_token
+                current_len += 1
+                n_tokens_generated += 1
+
+                # === Decode phase ===
+                while not end_token_found and n_tokens_generated < max_new_tokens:
+                    new_token = generated_tokens[:, current_len - 1 : current_len]
+                    new_pos = torch.tensor([[current_len - 1]], device=self.device)
+                    decode_mask = causal_mask[current_len - 1, :].unsqueeze(0).unsqueeze(0)
+
+                    logits = self.model(new_token, input_pos=new_pos, mask=decode_mask)
+                    next_logits = logits[:, -1, :]
+
+                    if return_logits:
+                        generation_logits.append(
+                            (next_logits / temperature).clone().detach().cpu()
+                        )
+
+                    next_token = self._sample_next_token(
+                        next_logits,
+                        generated_tokens[:, :current_len],
+                        temperature,
+                        top_k,
+                        repetition_penalty,
+                        sample_max,
+                    )
+
+                    if next_token.item() == self.tokenizer.eos_token_id:
+                        end_token_found = True
+
+                    generated_tokens[0, current_len] = next_token
+                    current_len += 1
+                    n_tokens_generated += 1
+
+            finally:
+                self._delete_kv_caches()
+
+        final_tokens = generated_tokens[:, :current_len]
+        max_tokens_generated = n_tokens_generated >= max_new_tokens
+
+        if return_logits:
+            return {
+                "response_ids": final_tokens,
+                "logits": torch.stack(generation_logits, dim=1),
+                "max_tokens_generated": max_tokens_generated,
+                "end_token_found": end_token_found,
+            }
+
+        return {
+            "response_ids": final_tokens,
+            "max_tokens_generated": max_tokens_generated,
+            "end_token_found": end_token_found,
         }
 
     def generate(
         self,
         prompt: str,
-        max_new_tokens: int = 50,
-        temperature: float = 1.0,
-        top_k: int | None = None,
+        config: GenerationConfig | None = None,
         sample_max: bool = False,
-        repetition_penalty: float = 1.0,
         return_logits: bool = False,
     ):
         """Generate tokens from a text prompt.
 
         Args:
             prompt (str): Input text prompt.
-            max_new_tokens (int): Maximum number of new tokens to generate.
-            temperature (float): Sampling temperature.
-            top_k (int | None): Top-k sampling parameter.
+            config (GenerationConfig | None): Generation configuration. Uses defaults if None.
             sample_max (bool): Whether to sample the maximum probability token.
-            repetition_penalty (float): Repetition penalty factor.
             return_logits (bool): Whether to return logits along with generated tokens.
 
         """
+        config = config or GenerationConfig()
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt")
         res = self._generate_from_tensor(
             input_ids=input_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
+            max_new_tokens=config.max_new_tokens,
+            temperature=config.temperature,
+            top_k=config.top_k,
             sample_max=sample_max,
-            repetition_penalty=repetition_penalty,
+            repetition_penalty=config.repetition_penalty,
             return_logits=return_logits,
+            use_kv_cache=config.use_kv_cache,
         )
         generated_ids = res["response_ids"][0][len(input_ids[0]) :]
         response_text = self.tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
@@ -324,41 +505,46 @@ class QwenModel(SetupQwenModel):
 
 class QwenModelValueHead(SetupQwenModel):
     def __init__(self, model_path: str, model_type: str = "QWEN2", **kwargs):
-        # Don't create optimizer in parent init - we'll do it after adding value_head
-        training_enabled = kwargs.get("training_enabled", False)
-        kwargs["training_enabled"] = False
-        super().__init__(model_path=model_path, model_type=model_type, **kwargs)
+        # Extract and remove training_enabled to prevent parent from creating optimizer
+        training_enabled = kwargs.pop("training_enabled", False)
+        freeze_backbone = kwargs.pop("freeze_backbone", False)
+
+        # Pass training_enabled=False to parent to prevent premature optimizer creation
+        super().__init__(model_path=model_path, model_type=model_type, training_enabled=False, **kwargs)
 
         self.hidden_size = self._get_hidden_size()
         self.value_head = nn.Linear(self.hidden_size, 1)
         self.value_head.to(self.device)
 
+        if freeze_backbone:
+            for param in self.model.parameters():
+                param.requires_grad = False
+
         # Now configure optimizer to include value_head parameters
         if training_enabled:
+            lr = kwargs.get("lr", 1e-06)
+            weight_decay = kwargs.get("weight_decay", 0.0)
+            beta1 = kwargs.get("beta1", 0.9)
+            beta2 = kwargs.get("beta2", 0.999)
             self.training_enabled = True
             self.model.train()
-            self.optimizer = self._configure_optimizer_with_value_head(
-                lr=kwargs.get("lr", 1e-06),
-                weight_decay=kwargs.get("weight_decay", 0.0),
-                betas=(kwargs.get("beta1", 0.9), kwargs.get("beta2", 0.999)),
-            )
+            self.optimizer = self._configure_optimizer(lr, weight_decay, (beta1, beta2))
 
-    def _configure_optimizer_with_value_head(self, lr, weight_decay, betas):
+    def _configure_optimizer(self, lr, weight_decay, betas):
         """Configure optimizer including both model and value_head parameters."""
         import inspect
 
         # Get model parameters
         model_params = {pn: p for pn, p in self.model.named_parameters() if p.requires_grad}
-        decay_params = [p for n, p in model_params.items() if p.dim() > 1]
-        no_decay_params = [p for n, p in model_params.items() if p.dim() <= 1]
+        decay_params = [p for _, p in model_params.items() if p.dim() > 1]
+        no_decay_params = [p for _, p in model_params.items() if p.dim() <= 1]
 
-        # Add value_head parameters (value_head.weight has dim > 1, bias has dim 1)
-        for name, param in self.value_head.named_parameters():
-            if param.requires_grad:
-                if param.dim() > 1:
-                    decay_params.append(param)
-                else:
-                    no_decay_params.append(param)
+        head_params = {pn: p for pn, p in self.value_head.named_parameters() if p.requires_grad}
+        head_decay_params = [p for _, p in head_params.items() if p.dim() > 1]
+        head_no_decay_params = [p for _, p in head_params.items() if p.dim() <= 1]
+
+        decay_params.extend(head_decay_params)
+        no_decay_params.extend(head_no_decay_params)
 
         optim_groups = [
             {"params": decay_params, "weight_decay": weight_decay},
@@ -367,7 +553,9 @@ class QwenModelValueHead(SetupQwenModel):
 
         num_decay = sum(p.numel() for p in decay_params)
         num_no_decay = sum(p.numel() for p in no_decay_params)
-        print(f"Value model optimizer: {num_decay} decay params, {num_no_decay} no_decay params (includes value_head)")
+        print(
+            f"Value model optimizer: {num_decay} decay params, {num_no_decay} no_decay params (includes value_head)"
+        )
 
         device_type = "cuda" if torch.cuda.is_available() else "cpu"
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
@@ -422,26 +610,40 @@ if __name__ == "__main__":
     model = QwenModel(model_path="/workspace/base_models/Qwen2.5-1.5B")
     print("Model and optimizer initialized successfully.")
 
-    prompts = ["Explain the theory of relativity in simple terms.", "How do airplanes fly?"]
-    generation_outputs = [
-        model.generate(
-            prompt,
-            max_new_tokens=100,
-            temperature=0.7,
-            top_k=50,
-            sample_max=False,
-            repetition_penalty=1.2,
-            return_logits=False,
-        )
-        for prompt in prompts
-    ]
+    # Test with KV cache enabled (default)
+    gen_config_cached = GenerationConfig(
+        max_new_tokens=100,
+        temperature=0.7,
+        top_k=50,
+        repetition_penalty=1.2,
+        use_kv_cache=True,
+    )
 
-    for generation_output in generation_outputs:
-        print("Prompt:", generation_output["input_text"])
-        print("Response:", generation_output["response_text"])
+    # Test without KV cache
+    gen_config_no_cache = GenerationConfig(
+        max_new_tokens=100,
+        temperature=0.7,
+        top_k=50,
+        repetition_penalty=1.2,
+        use_kv_cache=False,
+    )
 
+    prompt = "Explain the theory of relativity in simple terms."
+
+    print("\n=== Generation with KV cache ===")
+    output_cached = model.generate(prompt, config=gen_config_cached)
+    print("Prompt:", output_cached["input_text"])
+    print("Response:", output_cached["response_text"])
+
+    print("\n=== Generation without KV cache ===")
+    output_no_cache = model.generate(prompt, config=gen_config_no_cache)
+    print("Prompt:", output_no_cache["input_text"])
+    print("Response:", output_no_cache["response_text"])
+
+    # Test batched response properties
+    generation_outputs = [output_cached, output_no_cache]
     response_properties = model.get_batched_response_properties(generation_outputs, pad_to=256)
-    print("Batched response properties computed successfully.")
+    print("\nBatched response properties computed successfully.")
 
     value_model = QwenModelValueHead(model_path="/workspace/base_models/Qwen2.5-1.5B")
     dummy_input_ids = torch.tensor([[1, 2, 3, 4, 5]])

@@ -1,0 +1,7 @@
+{
+    "log_freq": 2,
+    "save_freq": 50,
+    "eval_freq": 10,
+    "output_dir": "./ppo_outputs",
+    "experiment_name": "no-kv-cache"
+}

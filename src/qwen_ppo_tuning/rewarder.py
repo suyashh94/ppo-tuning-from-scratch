@@ -19,8 +19,8 @@ class SentimentRewarder(nn.Module):
     # Label mapping for the cardiffnlp model
     LABEL_MAP = {
         "negative": -1.0,
-        "neutral": 0.0,
-        "positive": 1.0,
+        "neutral": 0.1,
+        "positive": 10.0,
     }
 
     def __init__(
@@ -163,4 +163,6 @@ if __name__ == "__main__":
     print("Batch rewards:")
     batch_results = rewarder.get_rewards_batch(test_texts)
     for i, text in enumerate(test_texts):
-        print(f"  [{batch_results['labels'][i]:>8}] reward={batch_results['rewards'][i]:>6.3f}  {text[:40]}...")
+        print(
+            f"  [{batch_results['labels'][i]:>8}] reward={batch_results['rewards'][i]:>6.3f}  {text[:40]}..."
+        )

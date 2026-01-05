@@ -14,18 +14,35 @@ def logprobs_from_logits(logits, labels):
     return logpy
 
 
-def pad_sequences(seqs, pad_value, padding="right", pad_to: int = None):  # type: ignore
+def pad_sequences(seqs, pad_value, padding="right", pad_to: int = None, truncate: bool = True):  # type: ignore
     """
-    Padding sequence to the same length
+    Pad (and optionally truncate) sequences to the same length.
+
+    Args:
+        seqs: List of sequences to pad.
+        pad_value: Value to use for padding.
+        padding: "right" or "left" - where to add padding.
+        pad_to: Target length. If None, uses max sequence length.
+        truncate: If True, truncate sequences longer than pad_to.
     """
     max_len = max(len(seq) for seq in seqs) if pad_to is None else pad_to
-    if padding == "right":
-        padded_seqs = [seq + [pad_value] * (max_len - len(seq)) for seq in seqs]
-    elif padding == "left":
-        padded_seqs = [[pad_value] * (max_len - len(seq)) + seq for seq in seqs]
-    else:
-        assert ValueError
-    return padded_seqs
+
+    result = []
+    for seq in seqs:
+        # Truncate if needed
+        if truncate and len(seq) > max_len:
+            seq = seq[:max_len]
+
+        # Pad if needed
+        pad_amount = max_len - len(seq)
+        if padding == "right":
+            result.append(seq + [pad_value] * pad_amount)
+        elif padding == "left":
+            result.append([pad_value] * pad_amount + seq)
+        else:
+            raise ValueError(f"padding must be 'right' or 'left', got '{padding}'")
+
+    return result
 
 
 def calculate_clip_fraction(ratio, clip_range):
