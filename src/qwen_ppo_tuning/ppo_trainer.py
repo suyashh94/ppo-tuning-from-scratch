@@ -232,7 +232,11 @@ class PPOTrainer:
         ref_response_properties = self.reference_model.get_batched_response_properties(
             policy_model_outputs, pad_to=128
         )
-        policy_response_properties["old_logprobs"] = ref_response_properties["logprobs"].detach()
+        # Store policy model's logprobs as old_logprobs (for PPO ratio calculation)
+        # These are the logprobs from the policy at generation time, before any updates
+        policy_response_properties["old_logprobs"] = policy_response_properties["logprobs"].detach().clone()
+        # Store reference model's logprobs separately for KL penalty calculation
+        policy_response_properties["ref_logprobs"] = ref_response_properties["logprobs"].detach()
 
         with torch.no_grad():
             value_preds = self.value_model(
@@ -241,23 +245,26 @@ class PPOTrainer:
         value_preds = value_preds[:, :-1, :].squeeze(-1).to(self.device)
 
         rewards = self.get_rewards(policy_model_outputs)
+        # KL penalty is between policy and reference model (not old policy)
         kl_diff = policy_response_properties["logprobs"].to(
             self.device
-        ) - policy_response_properties["old_logprobs"].to(self.device)
+        ) - policy_response_properties["ref_logprobs"].to(self.device)
         kl_penalty = self.kl_coef * kl_diff
-        total_rewards = rewards - kl_penalty
+
         total_rewards_aligned = self.collate_rewards_tensor(
-            total_rewards,
+            rewards,
             policy_response_properties["response_id_lengths"],
             policy_response_properties["response_mask"].size(1),
         )
 
+        total_rewards_aligned = total_rewards_aligned - kl_penalty
+
         return {
             "policy_response_properties": policy_response_properties,
             "value_preds": value_preds,
-            "rewards": total_rewards,
+            "rewards": rewards,
             "kl_penalty": kl_penalty,
-            "total_rewards": total_rewards,
+            "total_rewards": rewards,
             "policy_model_outputs": policy_model_outputs,
             "rewards_tensor": total_rewards_aligned,
         }
@@ -411,8 +418,11 @@ class PPOTrainer:
 
                     logprobs = logprobs_from_logits(logits, labels=mb_padded_generated_ids[:, 1:])
 
-                    # Calculate ratios
-                    ratios = torch.exp(logprobs - mb_old_logprobs)
+                    # Calculate ratios with numerical stability
+                    # Clamp log ratio to prevent extreme values
+                    log_ratio = logprobs - mb_old_logprobs
+                    log_ratio = torch.clamp(log_ratio, -20.0, 20.0)  # Prevent exp overflow
+                    ratios = torch.exp(log_ratio)
 
                     # Policy loss
                     surr1 = ratios * mb_advantages
@@ -441,12 +451,38 @@ class PPOTrainer:
 
                     total_loss = policy_loss + self.vf_coef * value_loss + entropy_loss
 
+                # Check for NaN/Inf in loss before backward pass
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"[Warning] NaN/Inf detected in loss at step {self.train_steps_taken}.")
+                    print(f"  policy_loss={policy_loss.item()}, value_loss={value_loss.item()}")
+                    print(f"  advantages: min={mb_advantages.min().item():.4f}, max={mb_advantages.max().item():.4f}")
+                    print(f"  logprobs: min={logprobs.min().item():.4f}, max={logprobs.max().item():.4f}")
+                    print(f"  old_logprobs: min={mb_old_logprobs.min().item():.4f}, max={mb_old_logprobs.max().item():.4f}")
+                    self.policy_model.optimizer.zero_grad()
+                    self.value_model.optimizer.zero_grad()
+                    self.train_steps_taken += 1
+                    continue
+
                 self.policy_model.optimizer.zero_grad()
                 self.value_model.optimizer.zero_grad()
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.policy_model.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), self.max_grad_norm)
-                torch.nn.utils.clip_grad_norm_(self.value_model.parameters(), self.max_grad_norm)
+                self.scaler.unscale_(self.value_model.optimizer)
+
+                # Check for NaN in gradients
+                policy_grad_norm = torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), self.max_grad_norm)
+                value_grad_norm = torch.nn.utils.clip_grad_norm_(self.value_model.parameters(), self.max_grad_norm)
+
+                if torch.isnan(policy_grad_norm) or torch.isnan(value_grad_norm):
+                    print(f"[Warning] NaN gradient detected at step {self.train_steps_taken}. Skipping update.")
+                    print(f"  policy_grad_norm={policy_grad_norm.item()}, value_grad_norm={value_grad_norm.item()}")
+                    self.policy_model.optimizer.zero_grad()
+                    self.value_model.optimizer.zero_grad()
+                    # Must call update() to reset scaler state after unscale_()
+                    self.scaler.update()
+                    self.train_steps_taken += 1
+                    continue
+
                 self.scaler.step(self.policy_model.optimizer)
                 self.scaler.step(self.value_model.optimizer)
                 self.scaler.update()

@@ -163,10 +163,23 @@ class QwenModel(SetupQwenModel):
                     )
                     next_token_logits[indices_to_remove] = -float("Inf")
 
+                # Handle numerical stability issues
+                # Replace NaN/Inf with very small/large finite values
+                next_token_logits = torch.nan_to_num(
+                    next_token_logits,
+                    nan=0.0,
+                    posinf=1e20,
+                    neginf=-1e20,
+                )
+
                 if sample_max:
                     next_token = torch.argmax(next_token_logits, dim=-1)
                 else:
                     probabilities = torch.nn.functional.softmax(next_token_logits, dim=-1)
+                    # Clamp probabilities to ensure they're valid for multinomial
+                    probabilities = torch.clamp(probabilities, min=1e-20)
+                    # Renormalize after clamping
+                    probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
                     next_token = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
 
                 if next_token.item() == self.tokenizer.eos_token_id:
@@ -311,10 +324,57 @@ class QwenModel(SetupQwenModel):
 
 class QwenModelValueHead(SetupQwenModel):
     def __init__(self, model_path: str, model_type: str = "QWEN2", **kwargs):
+        # Don't create optimizer in parent init - we'll do it after adding value_head
+        training_enabled = kwargs.get("training_enabled", False)
+        kwargs["training_enabled"] = False
         super().__init__(model_path=model_path, model_type=model_type, **kwargs)
+
         self.hidden_size = self._get_hidden_size()
         self.value_head = nn.Linear(self.hidden_size, 1)
         self.value_head.to(self.device)
+
+        # Now configure optimizer to include value_head parameters
+        if training_enabled:
+            self.training_enabled = True
+            self.model.train()
+            self.optimizer = self._configure_optimizer_with_value_head(
+                lr=kwargs.get("lr", 1e-06),
+                weight_decay=kwargs.get("weight_decay", 0.0),
+                betas=(kwargs.get("beta1", 0.9), kwargs.get("beta2", 0.999)),
+            )
+
+    def _configure_optimizer_with_value_head(self, lr, weight_decay, betas):
+        """Configure optimizer including both model and value_head parameters."""
+        import inspect
+
+        # Get model parameters
+        model_params = {pn: p for pn, p in self.model.named_parameters() if p.requires_grad}
+        decay_params = [p for n, p in model_params.items() if p.dim() > 1]
+        no_decay_params = [p for n, p in model_params.items() if p.dim() <= 1]
+
+        # Add value_head parameters (value_head.weight has dim > 1, bias has dim 1)
+        for name, param in self.value_head.named_parameters():
+            if param.requires_grad:
+                if param.dim() > 1:
+                    decay_params.append(param)
+                else:
+                    no_decay_params.append(param)
+
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+
+        num_decay = sum(p.numel() for p in decay_params)
+        num_no_decay = sum(p.numel() for p in no_decay_params)
+        print(f"Value model optimizer: {num_decay} decay params, {num_no_decay} no_decay params (includes value_head)")
+
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        extra_args = {"fused": True} if use_fused else {}
+
+        return torch.optim.AdamW(optim_groups, lr=lr, betas=betas, **extra_args)
 
     def forward(self, input_ids: torch.LongTensor):
         hidden_states = self.get_last_hidden_state(input_ids.to(self.device))

@@ -4,8 +4,11 @@ import torch.nn.functional as F
 
 def logprobs_from_logits(logits, labels):
     """
+    Extract log probabilities for given labels from logits.
     See: https://github.com/pytorch/pytorch/issues/563#issuecomment-330103591
     """
+    # Add numerical stability - clamp logits to prevent overflow in softmax
+    logits = torch.clamp(logits, -100.0, 100.0)
     logp = F.log_softmax(logits, dim=-1)
     logpy = torch.gather(logp, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
     return logpy
@@ -95,13 +98,25 @@ class RunningMoments:
 @torch.no_grad()
 def whiten(xs: torch.Tensor, mask: torch.BoolTensor, shift_mean=True) -> torch.Tensor:
     """
-    Whitens values
+    Whitens values with proper masking.
+
+    Args:
+        xs: Values to whiten
+        mask: Boolean mask indicating valid values
+        shift_mean: If True, center values around 0; if False, preserve original mean
     """
+    # Only sum masked values for mean calculation
+    masked_xs = xs * mask.float()
+    n_valid = mask.sum().clamp(min=1)  # Avoid division by zero
+    mean = masked_xs.sum() / n_valid
+    var = torch.sum(((xs - mean) ** 2) * mask.float()) / n_valid
 
-    mean = xs.sum() / mask.sum()
-    var = torch.sum(((xs - mean) ** 2).mul(mask)) / mask.sum()
+    # Add small epsilon and handle edge case of zero variance
+    whitened = (xs - mean) * torch.rsqrt(var + 1e-8)
 
-    whitened = (xs - mean) * torch.rsqrt(var + 1e-6)
+    # Clamp to prevent extreme values
+    whitened = torch.clamp(whitened, -10.0, 10.0)
+
     if not shift_mean:
         whitened += mean
     return whitened
