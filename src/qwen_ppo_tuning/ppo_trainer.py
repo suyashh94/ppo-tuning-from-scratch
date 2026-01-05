@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import random
 
 import torch
 from torch.optim import lr_scheduler
@@ -68,6 +69,16 @@ class PPOTrainer:
 
         self._setup_schedulers()
         self.save_configs()
+        self.dataset = [
+            "I think the book was",
+            "The movie was",
+            "Overall, the product is",
+            "The restaurant experience was",
+            "The service at the hotel was",
+            "The game was",
+            "The concert was",
+            "The play was",
+        ]
 
     def save_configs(self):
         """Save configuration dataclasses to JSON files."""
@@ -144,7 +155,7 @@ class PPOTrainer:
 
         while i < self.training_config.num_rollouts_per_update:
             policy_model_output = self.policy_model.generate(
-                prompt="The movie was", config=self.generation_config
+                prompt=random.choice(self.dataset), config=self.generation_config
             )
             policy_model_outputs.append(policy_model_output)
             i += 1
@@ -564,7 +575,7 @@ class PPOTrainer:
         self.policy_model.eval()
         print(f"\n{'=' * 50} EVALUATION (Step {self.train_steps_taken}) {'=' * 50}")
 
-        prompts = ["The movie was"] * 5
+        prompts = self.dataset[:5]  # Evaluate on a subset of prompts
 
         generated_outputs = [
             self.policy_model.generate(prompt=prompt, config=self.generation_config)
