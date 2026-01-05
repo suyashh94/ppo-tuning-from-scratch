@@ -301,20 +301,21 @@ class PPOTrainer:
         Returns:
             Tensor of shape (batch_size, max_len) with rewards aligned to response tokens.
 
-        Example:
-            For a batch of 2 responses, with input ids and response ids as follows:
-                input_ids = [[101, 200, 300, 102], [101, 400, 500, 600, 102]]
-                generated_ids = [[201, 202, EOS_ID], [401, 402, 403, EOS_ID]]
-            The response_id_lengths would be [4+3, 5+4] = [7, 9] (including input and response lengths).
-            If the rewards tensor is [1.0, 0.5], and max_len is 10, the output rewards_tensor would be:
-                [[0,0,0,0,0,1,0,0,0,0],[0,0,0,0,0,0,0,0.5,0,0]] as reward is aligned to the last token that led to generation of EOS token.
+        Note:
+            The reward is placed at position response_length - 2 (not response_length - 1)
+            because the masks/logits are shifted by 1. The action at position t generates
+            token t+1, so the last response action is at response_length - 2 in the
+            shifted indexing used by response_mask.
         """
         batch_size = rewards.size(0)
         rewards_tensor = torch.zeros((batch_size, max_len), device=rewards.device)
 
         for i in range(batch_size):
             response_length = response_id_lengths[i]
-            rewards_tensor[i, response_length - 1] = rewards[i]
+            # Place reward at last response action position (aligned with response_mask)
+            # response_mask covers positions prompt_length-1 to response_length-2
+            reward_position = max(0, response_length - 2)
+            rewards_tensor[i, reward_position] = rewards[i]
 
         return rewards_tensor
 
@@ -405,7 +406,8 @@ class PPOTrainer:
                     self.device
                 )
                 mb_old_logprobs = policy_response_properties["logprobs"][mb_indices].to(self.device)
-                mb_advantages = advantages[mb_indices]
+                mb_advantages = advantages[mb_indices]  # Whitened advantages for policy loss
+                mb_raw_advantages = raw_advantages[mb_indices]  # Raw advantages for value loss
                 mb_value_preds = value_preds[mb_indices]
 
                 # Forward pass with mixed precision
@@ -439,7 +441,9 @@ class PPOTrainer:
                     value_pred_clipped = mb_value_preds + torch.clamp(
                         values - mb_value_preds, -self.vf_clip_epsilon, self.vf_clip_epsilon
                     )
-                    returns = mb_advantages.detach() + mb_value_preds.detach()
+                    # Use RAW advantages (not whitened) for computing returns
+                    # returns = advantages + values, so returns = raw_adv + old_values
+                    returns = mb_raw_advantages.detach() + mb_value_preds.detach()
                     value_losses1 = (values - returns) ** 2
                     value_losses2 = (value_pred_clipped - returns) ** 2
                     value_loss = torch.max(value_losses1, value_losses2)
