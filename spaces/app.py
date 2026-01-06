@@ -89,28 +89,25 @@ def clear_memory():
 
 
 def format_reward_display(reward_info: dict, eos_found: bool, final_reward: float) -> str:
-    """Format reward information for display (no emojis)."""
+    """Format reward information for display."""
     sentiment = reward_info["label"].upper()
     confidence = reward_info["confidence"]
-    raw_reward = reward_info["reward"]
-
-    lines = [
-        f"**Sentiment Label:** {sentiment}",
-        f"**Confidence:** {confidence:.1%}",
-        f"**Sentiment Reward:** {raw_reward:+.2f}",
-    ]
+    sentiment_reward = reward_info["reward"]
 
     if eos_found:
-        lines.append("**EOS Penalty:** 0 (token found)")
+        return f"""Sentiment: {sentiment}
+Confidence: {confidence:.1%}
+Sentiment Reward: {sentiment_reward:+.2f}
+EOS Token: Found
+----------------
+FINAL REWARD: {final_reward:+.2f}"""
     else:
-        lines.append("**EOS Penalty:** -10 (token missing)")
-
-    lines.extend([
-        "───────────────",
-        f"**Final Reward:** {final_reward:+.2f}",
-    ])
-
-    return "\n".join(lines)
+        return f"""Sentiment: {sentiment}
+Confidence: {confidence:.1%}
+Sentiment Reward: {sentiment_reward:+.2f} (ignored)
+EOS Token: Missing
+----------------
+FINAL REWARD: -10.00"""
 
 
 # ============================================================================
@@ -244,13 +241,16 @@ def generate_comparison(prompt: str):
         print("Reward model unloaded.")
 
         # Apply EOS penalty (same as training)
-        base_reward = base_reward_info["reward"]
-        if not base_output["eos_found"]:
-            base_reward -= 10.0
+        # If EOS not found, reward is -10. If found, reward is sentiment reward.
+        if base_output["eos_found"]:
+            base_reward = base_reward_info["reward"]
+        else:
+            base_reward = -10.0
 
-        aligned_reward = aligned_reward_info["reward"]
-        if not aligned_output["eos_found"]:
-            aligned_reward -= 10.0
+        if aligned_output["eos_found"]:
+            aligned_reward = aligned_reward_info["reward"]
+        else:
+            aligned_reward = -10.0
 
         # Format reward displays
         base_reward_text = format_reward_display(
@@ -289,24 +289,7 @@ def generate_comparison(prompt: str):
 # Gradio Interface
 # ============================================================================
 
-CUSTOM_CSS = """
-.status-box {
-    font-weight: bold;
-    padding: 8px;
-    border-radius: 4px;
-    margin-bottom: 8px;
-}
-.output-box {
-    min-height: 100px;
-}
-.reward-box {
-    background-color: #e8f4e8;
-    border: 2px solid #4a9c4a;
-    border-radius: 8px;
-    padding: 12px;
-    margin-top: 8px;
-}
-"""
+CUSTOM_CSS = ""
 
 with gr.Blocks(css=CUSTOM_CSS, title="Base vs Aligned LLM Comparison") as demo:
     # Header
@@ -363,17 +346,16 @@ with gr.Blocks(css=CUSTOM_CSS, title="Base vs Aligned LLM Comparison") as demo:
             base_status = gr.Textbox(
                 label="Status",
                 interactive=False,
-                elem_classes=["status-box"],
             )
             base_response = gr.Textbox(
                 label="Response",
                 lines=4,
                 interactive=False,
-                elem_classes=["output-box"],
             )
-            base_reward = gr.Markdown(
+            base_reward = gr.Textbox(
                 label="Reward Analysis",
-                elem_classes=["reward-box"],
+                lines=6,
+                interactive=False,
             )
 
         # Aligned model column
@@ -382,17 +364,16 @@ with gr.Blocks(css=CUSTOM_CSS, title="Base vs Aligned LLM Comparison") as demo:
             aligned_status = gr.Textbox(
                 label="Status",
                 interactive=False,
-                elem_classes=["status-box"],
             )
             aligned_response = gr.Textbox(
                 label="Response",
                 lines=4,
                 interactive=False,
-                elem_classes=["output-box"],
             )
-            aligned_reward = gr.Markdown(
+            aligned_reward = gr.Textbox(
                 label="Reward Analysis",
-                elem_classes=["reward-box"],
+                lines=6,
+                interactive=False,
             )
 
     gr.Markdown("---")
