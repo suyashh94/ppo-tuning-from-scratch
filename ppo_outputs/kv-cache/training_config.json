@@ -1,0 +1,10 @@
+{
+    "learning_rate": 5e-06,
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
+    "warmup_steps_frac": 0.1,
+    "lr_scheduler_type": "cosine",
+    "total_steps": 10000,
+    "num_rollouts_per_update": 8,
+    "minibatch_size": 4
+}
