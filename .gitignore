@@ -67,3 +67,4 @@ Thumbs.db
 
 # Model folders
 base_models/
+.claude/settings.local.json
